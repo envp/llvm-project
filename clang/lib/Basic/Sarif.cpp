@@ -22,6 +22,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/ConvertUTF.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/Path.h"
 
@@ -180,6 +181,19 @@ static StringRef importanceToStr(ThreadFlowImportance I) {
   llvm_unreachable("Fully covered switch is not so fully covered");
 }
 
+static StringRef resultLevelToStr(SarifResultLevel R) {
+  switch (R) {
+  case SarifResultLevel::Note:
+    return "note";
+  case SarifResultLevel::Warning:
+    return "warning";
+  case SarifResultLevel::Error:
+    return "error";
+  }
+  llvm_unreachable("Potentially un-handled SarifResultLevel. "
+                   "Is the switch not fully covered?");
+}
+
 static json::Object
 createThreadFlowLocation(json::Object &&Location,
                          const ThreadFlowImportance &Importance) {
@@ -253,10 +267,15 @@ void SarifDocumentWriter::endRun() {
   json::Object &Tool = getCurrentTool();
   json::Array Rules;
   for (const SarifRule &R : CurrentRules) {
+    json::Object Config{
+        {"enabled", R.DefaultConfiguration.Enabled},
+        {"level", resultLevelToStr(R.DefaultConfiguration.Level)},
+        {"rank", R.DefaultConfiguration.Rank}};
     json::Object Rule{
         {"name", R.Name},
         {"id", R.Id},
-        {"fullDescription", json::Object{{"text", R.Description}}}};
+        {"fullDescription", json::Object{{"text", R.Description}}},
+        {"defaultConfiguration", std::move(Config)}};
     if (!R.HelpURI.empty())
       Rule["helpUri"] = R.HelpURI;
     Rules.emplace_back(std::move(Rule));
@@ -358,9 +377,12 @@ void SarifDocumentWriter::appendResult(const SarifResult &Result) {
   size_t RuleIdx = Result.RuleIdx;
   assert(RuleIdx < CurrentRules.size() &&
          "Trying to reference a rule that doesn't exist");
+  const SarifRule &Rule = CurrentRules[RuleIdx];
+  assert(Rule.DefaultConfiguration.Enabled &&
+         "Cannot add a result referencing a disabled Rule");
   json::Object Ret{{"message", createMessage(Result.DiagnosticMessage)},
                    {"ruleIndex", static_cast<int64_t>(RuleIdx)},
-                   {"ruleId", CurrentRules[RuleIdx].Id}};
+                   {"ruleId", Rule.Id}};
   if (!Result.Locations.empty()) {
     json::Array Locs;
     for (auto &Range : Result.Locations) {
@@ -370,6 +392,12 @@ void SarifDocumentWriter::appendResult(const SarifResult &Result) {
   }
   if (!Result.ThreadFlows.empty())
     Ret["codeFlows"] = json::Array{createCodeFlow(Result.ThreadFlows)};
+
+  if (Result.LevelOverride.hasValue())
+    Ret["level"] = resultLevelToStr(Result.LevelOverride.getValue());
+  else
+    Ret["level"] = resultLevelToStr(Rule.DefaultConfiguration.Level);
+
   json::Object &Run = getCurrentRun();
   json::Array *Results = Run.getArray("results");
   Results->emplace_back(std::move(Ret));
